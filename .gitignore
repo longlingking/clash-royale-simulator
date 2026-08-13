@@ -1,6 +1,13 @@
 ideas/
 *.DS_store
-src/clahser_new/cr_logs/
 .idea/
 *.xml
 *.iml
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Trained model weights (stable-baselines3 checkpoints)
+*.zip
+cr_logs/

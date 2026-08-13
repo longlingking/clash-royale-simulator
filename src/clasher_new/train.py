@@ -1,14 +1,29 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# card_utils.py opens gamedata.json relative to CWD, so pin the working
+# directory to this script's location before importing anything game-related.
+_BASE = os.path.dirname(os.path.abspath(__file__))
+os.chdir(_BASE)
+
 from environment import CREnv, random_strategy, entity_names
 
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
-import torch.nn as nn
-import torch.nn.functional as F
-import torch
+from stable_baselines3.common.callbacks import CheckpointCallback
 
-import time
+from self_play import (
+    BestWeightCallback,
+    OpponentPool,
+    OpponentSwapCallback,
+    bridge_rush_left_script,
+    bridge_rush_script,
+    defender_script,
+)
+
 
 class CRFeatureExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: spaces.Box, features_dim: int = 256):
@@ -54,46 +69,67 @@ class CRFeatureExtractor(BaseFeaturesExtractor):
         return torch.relu(self.fc(combined))
 
 
-class WeightsCopyingCallback(BaseCallback):
-    def __init__(self, verbose=0):
-        super().__init__(verbose)
+def make_eval_crowd(base_dir):
+    """The FIXED opponents used for best-model selection. Never changes during
+    a run, so the winrate numbers stay comparable across evaluations.
 
-    def _on_step(self):
-        if self.num_timesteps % 50000 == 0:
-            opponent.policy.load_state_dict(self.model.policy.state_dict())
-        return True
-
-class RandomEvalCallback(BaseCallback):
-    def __init__(self, verbose=0):
-        super().__init__(verbose)
-
-    def _on_step(self) -> bool:
-        if self.num_timesteps % 50000 == 0:
-            rewards = []
-            eval_env = CREnv(opponent_model=lambda obs: random_strategy(obs))
-            for i in range(5):
-                obs, _ = eval_env.reset()
-                done = False
-                total_reward = 0
-                while not done:
-                    action, _ = self.model.predict(obs)
-                    obs, reward, termination, truncation, info = eval_env.step(action)
-                    done = termination or truncation
-                    total_reward += reward
-
-                rewards.append(total_reward)
-            self.logger.record("eval/mean_reward_vs_random", sum(rewards)/len(rewards))
-        return True
+    Two of them are the already-trained checkpoints on disk (frozen here),
+    the rest are non-learning baselines.
+    """
+    return {
+        'random': random_strategy,
+        'bridge_rush': bridge_rush_script,
+        'bridge_rush_left': bridge_rush_left_script,
+        'defender': defender_script,
+        'cr_discrete': os.path.join(base_dir, 'cr_discrete.zip'),
+        'cr_checkpoint': os.path.join(base_dir, 'cr_checkpoint.zip'),
+    }
 
 
 if __name__ == '__main__':
-    env = CREnv(opponent_model=lambda obs: random_strategy(obs))
+    log_dir = os.path.join(_BASE, 'cr_logs')
+    os.makedirs(log_dir, exist_ok=True)
 
-    model = PPO.load("cr_discrete", env=env)
-    opponent = PPO.load("cr_discrete", env=env)
-    cb = CheckpointCallback(save_freq=10_000, save_path="./cr_logs/", name_prefix="cr")
+    # Self-play opponent pool: mostly recent snapshots of ourselves, some old
+    # checkpoints, some fixed baselines. Opponents never receive gradients.
+    pool = OpponentPool(
+        base_checkpoints=[
+            os.path.join(_BASE, 'cr_discrete.zip'),
+            os.path.join(_BASE, 'cr_checkpoint.zip'),
+        ],
+        recent_dir=log_dir,
+        prefix='cr',
+        n_recent=6,
+        fixed_strategies=[
+            random_strategy,
+            bridge_rush_script,
+            bridge_rush_left_script,
+            defender_script,
+        ],
+        weights={'recent': 0.6, 'base': 0.2, 'fixed': 0.2},
+        device='cpu',
+    )
+
+    env = CREnv(opponent_model=pool.pick())
+
+    model = PPO.load(os.path.join(_BASE, 'cr_discrete'), env=env,
+                     tensorboard_log=os.path.join(_BASE, 'tb_logs'))
+
+    callbacks = [
+        CheckpointCallback(save_freq=10_000, save_path=log_dir, name_prefix='cr'),
+        OpponentSwapCallback(env=env, pool=pool, swap_every=2048),
+        BestWeightCallback(
+            opponents=make_eval_crowd(_BASE),
+            eval_every=100_000,
+            n_games=20,
+            best_path=os.path.join(_BASE, 'best_model.zip'),
+            eval_at_start=True,
+            verbose=1,
+        ),
+    ]
     try:
-        model.learn(total_timesteps=1_000_000, reset_num_timesteps=False, callback=[cb])
+        model.learn(total_timesteps=1_000_000, reset_num_timesteps=False,
+                    tb_log_name='cr', callback=callbacks)
     finally:
         print('Saving model.')
-        model.save('cr_discrete')
+        model.save(os.path.join(_BASE, 'cr_discrete'))
