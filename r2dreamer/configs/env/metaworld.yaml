@@ -1,0 +1,20 @@
+task: 'metaworld_reach'
+steps: 1.01e6
+env_num: 16
+eval_episode_num: 10
+action_repeat: 2
+train_ratio: 512
+time_limit: 500
+
+seed: ${seed}
+device: ${device}
+
+size: [64, 64]
+encoder:
+  mlp_keys: '$^'
+  cnn_keys: 'image'
+decoder:
+  mlp_keys: '$^'
+  cnn_keys: 'image'
+
+camera: corner2

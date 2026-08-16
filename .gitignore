@@ -11,3 +11,7 @@ __pycache__/
 # Trained model weights (stable-baselines3 checkpoints)
 *.zip
 cr_logs/
+# r2dreamer integration
+r2dreamer/logdir/
+r2dreamer/.hydra/
+.pylibs/

@@ -1,0 +1,26 @@
+task: cr_clashroyale
+steps: 5e5
+env_num: 1
+eval_episode_num: 2
+action_repeat: 1
+# Each env step = 30 game frames = 0.5 s of battle time. The simulator forces
+# a draw at 180 s and ends at 300 s, so 600 steps is a full match (TimeLimit
+# is a safety net for degenerate episodes).
+time_limit: 600
+train_ratio: 64
+
+seed: ${seed}
+device: ${device}
+
+# Opponent for the trained agent: 'random' (default), a scripted strategy
+# ('script:bridge_rush' | 'script:bridge_rush_left' | 'script:defender'), or
+# a path to a stable-baselines3 PPO checkpoint.
+opponent: 'random'
+speed: 1.0
+
+encoder:
+  mlp_keys: '^(hand|elixir)$'
+  cnn_keys: 'grid'
+decoder:
+  mlp_keys: '^(hand|elixir)$'
+  cnn_keys: 'grid'

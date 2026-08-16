@@ -1,0 +1,42 @@
+defaults:
+  - env: dmc_vision
+  - model: size12M
+  # Disable Hydra's Python logging-to-file (train.log)
+  - override hydra/job_logging: disabled
+  - _self_
+
+logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S}
+seed: 0
+deterministic_run: False
+device: 'cuda:0'
+# Path to a checkpoint (logdir/latest.pt) to resume training from; '' = fresh run.
+resume: ''
+
+hydra:
+  run:
+    dir: ${logdir}
+
+batch_size: 16
+batch_length: 64
+
+buffer:
+  batch_size: ${batch_size}
+  batch_length: ${batch_length}
+  max_size: 5e5
+  device: ${device}
+  storage_device: ${device}
+
+trainer:
+  steps: ${env.steps}
+  pretrain: 0
+  eval_every: 1e4
+  eval_episode_num: ${env.eval_episode_num}
+  batch_size: ${batch_size}
+  batch_length: ${batch_length}
+  train_ratio: ${env.train_ratio}
+  video_pred_log: False
+  params_hist_log: False
+  update_log_every: 5e3
+  action_repeat: ${env.action_repeat}
+  # Save a checkpoint every N environment steps (protects against crashes/OOM).
+  save_every: 1e4

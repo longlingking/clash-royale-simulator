@@ -1,0 +1,19 @@
+# IsaacLab requires device=cuda:0; use CUDA_VISIBLE_DEVICES to pick a physical GPU.
+task: "isaaclab_Isaac-Cartpole-RGB-Camera-Direct-v0"
+steps: 1.01e6
+env_num: 16
+eval_episode_num: 0  # Eval not yet supported for IsaacLab
+action_repeat: 1
+train_ratio: 512
+headless: True
+
+seed: ${seed}
+device: ${device}
+
+size: [64, 64]
+encoder:
+  mlp_keys: '$^'
+  cnn_keys: 'image'
+decoder:
+  mlp_keys: '$^'
+  cnn_keys: 'image'
