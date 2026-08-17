@@ -453,7 +453,7 @@ class Dreamer(nn.Module):
         # advantage goes to zero (the actor then only learns entropy).  The
         # mean keeps the rare-but-important reward signal in the imagined
         # lambda-return.
-        imag_reward = self._frozen_reward(imag_feat).mean
+        imag_reward = self._frozen_reward(imag_feat).mean()
         # (B*T, T_imag, 1)  probability of continuation
         imag_cont = self._frozen_cont(imag_feat).mean
         # (B*T, T_imag, 1)
