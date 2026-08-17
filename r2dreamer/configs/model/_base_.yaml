@@ -28,7 +28,10 @@ loss_scales:
   rep: 0.1
   policy: 1.0
   value: 1.0
-  repval: 0.3
+  # Replay-based value learning carries the real reward signal; give it equal
+  # weight to the imagined value targets so the critic learns the true return
+  # distribution instead of collapsing onto the (flat) imagined bootstrap.
+  repval: 1.0
   swav: 1.0
   temp: 1.0
   norm: 1.0
