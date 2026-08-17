@@ -304,6 +304,11 @@ git merge b-machine                 # 在 A 机解决冲突、验证、push
 11. **`r2dreamer/runs/*.sh`、configs 里其它环境的文件是上游原样**，全部随
     vendor 提交，属预期，不要"清理"掉。
 12. numpy 版本：1.26 系即可（sim 与 pyproject 分别钉 1.26.4 / 1.26.0，同系兼容）。
+13. **Arrow Lake / 新 CPU 上 bf16 backward 崩溃**：Intel Core Ultra 200 系
+    （oneDNN 报 `avx2_vnni_2`）上，r2dreamer CPU 训练的 bf16 autocast 反向会报
+    `RuntimeError: DNNL does not support bf16/f16 backward`。`runs/cr.sh` 已内置
+    `export ONEDNN_MAX_CPU_ISA=AVX2` 绕开（等价：`DNNL_MAX_CPU_ISA=AVX2` 或
+    `torch.backends.mkldnn.enabled=False`）。若在其它机器上遇到同报错，照此处理。
 
 ---
 

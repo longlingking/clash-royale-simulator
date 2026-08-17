@@ -13,6 +13,11 @@ DATE=$(date +%m%d)
 STEPS=${1:-500000}
 METHOD=r2dreamer
 
+# r2dreamer uses bf16 autocast for the CPU update step; oneDNN's bf16
+# backward path crashes on avx2_vnni_2 CPUs (e.g. Intel Core Ultra 200
+# series): "DNNL does not support bf16/f16 backward". Cap ISA to AVX2.
+export ONEDNN_MAX_CPU_ISA=AVX2
+
 python train.py \
     env=cr \
     env.steps=$STEPS \
