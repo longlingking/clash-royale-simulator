@@ -15,3 +15,4 @@ cr_logs/
 r2dreamer/logdir/
 r2dreamer/.hydra/
 .pylibs/
+tb_logs/

@@ -11,14 +11,23 @@ against a fixed random baseline.
 Both models play the same role (player 0) with greedy/deterministic actions,
 so the only randomness is the random opponent and the per-game deck shuffle.
 
+Parallelism: as in training (train.py / benchmark_env.py), each model's games
+run across ``n_envs`` subprocess envs. The moment an env finishes a game it is
+reset and immediately starts the next, so all cores stay busy until exactly
+``n_games`` completions are counted (in-flight games are discarded). `best`
+runs first to completion, then `latest` — so the two models are never compared
+under different machine load.
+
 Usage:
-    python compare_weights.py [--n-games 50] [--best best_model.zip]
+    python compare_weights.py [--n-games 50] [--n-envs 8] [--best best_model.zip]
                               [--latest cr_logs/cr_XXX_steps.zip]
 """
 import argparse
 import glob
 import os
 import re
+
+import numpy as np
 import torch
 
 # card_utils.py opens gamedata.json relative to CWD, so pin the working
@@ -26,7 +35,10 @@ import torch
 _BASE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(_BASE)
 
+import gymnasium as gym
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import SubprocVecEnv
+
 from environment import CREnv, random_strategy
 
 
@@ -46,21 +58,67 @@ def _latest_checkpoint(log_dir='cr_logs', prefix='cr'):
     return max(matches, key=step)
 
 
-def play_games(model, opponent, n_games, deterministic=True):
-    """Play ``n_games`` as player 0 vs ``opponent`` (player 1); return wins."""
-    env = CREnv(opponent_model=None)
-    env.opponent = opponent
+class _WinnerInfo(gym.Wrapper):
+    """Re-export ``info['winner']`` on the terminal step.
+
+    ``CREnv.step`` returns the game-over flag but not the winner, and the
+    winner lives inside the subprocess env. SubprocVecEnv pickles ``info``
+    back to the main process, so this wrapper is how play_games counts wins.
+    """
+
+    def step(self, action):
+        obs, reward, termination, truncation, info = self.env.step(action)
+        if termination or truncation:
+            info = dict(info)
+            info['winner'] = self.unwrapped.battle.winner
+        return obs, reward, termination, truncation, info
+
+
+def _place_obs(stacked, single, i):
+    """Overwrite slot ``i`` of a stacked dict observation with one env's."""
+    for key, arr in single.items():
+        stacked[key][i] = arr
+    return stacked
+
+
+def play_games(model, n_games, n_envs=8):
+    """Play ``n_games`` as player 0 vs a random opponent, in parallel.
+
+    Each of the ``n_envs`` subprocess envs plays its own game; a finished env
+    is reset via ``vec.env_method`` and immediately starts the next. Counting
+    stops at exactly ``n_games`` completed games (in-flight games are
+    discarded). Returns the number of wins.
+    """
+    def make_env(_rank):
+        def _init():
+            # Subprocess envs run the sim + opponent inference themselves; keep
+            # them single-threaded so the processes don't fight over torch's pool.
+            torch.set_num_threads(1)
+            env = CREnv(opponent_model=None)
+            env.opponent = random_strategy
+            return _WinnerInfo(env)
+        return _init
+
+    vec = SubprocVecEnv([make_env(i) for i in range(n_envs)])
+    obs = vec.reset()
     wins = 0
-    for i in range(n_games):
-        obs, _ = env.reset()
-        done = False
-        while not done:
-            action, _ = model.predict(obs, deterministic=deterministic)
-            obs, _, termination, truncation, _ = env.step(action)
-            done = termination or truncation
-        wins += int(env.battle.winner == 0)
-        if (i + 1) % 10 == 0:
-            print(f'    game {i + 1}/{n_games} (wins so far: {wins})')
+    completed = 0
+    last_printed = 0
+    try:
+        while completed < n_games:
+            actions, _ = model.predict(obs, deterministic=True)
+            obs, _reward, dones, infos = vec.step(actions)
+            for i in np.where(dones)[0]:
+                completed += 1
+                wins += int(infos[i]['winner'] == 0)
+                if completed < n_games:  # start a fresh game in this slot
+                    reset_obs = vec.env_method('reset', indices=[i])[0]
+                    _place_obs(obs, reset_obs[0], int(i))
+            if completed >= last_printed + 10:
+                last_printed = completed
+                print(f'    game {completed}/{n_games} (wins so far: {wins})')
+    finally:
+        vec.close()  # reap the subprocess envs (avoids a hang on exit)
     return wins
 
 
@@ -69,6 +127,8 @@ def main():
         description='Compare best vs latest checkpoint against a random opponent.')
     ap.add_argument('--n-games', type=int, default=50,
                     help='games each weight plays vs random (default 50)')
+    ap.add_argument('--n-envs', type=int, default=8,
+                    help='parallel subprocess envs (default 8; see benchmark_env.py)')
     ap.add_argument('--best', default='best_model.zip')
     ap.add_argument('--latest', default=None,
                     help='explicit checkpoint path; default: newest in cr_logs/')
@@ -82,10 +142,10 @@ def main():
     latest_model = PPO.load(latest, device='cpu')
 
     n = args.n_games
-    print(f'\nbest   ({os.path.basename(args.best)}) vs random, {n} games')
-    best_wins = play_games(best_model, random_strategy, n)
-    print(f'\nlatest ({os.path.basename(latest)}) vs random, {n} games')
-    latest_wins = play_games(latest_model, random_strategy, n)
+    print(f'\nbest   ({os.path.basename(args.best)}) vs random, {n} games, {args.n_envs} parallel envs')
+    best_wins = play_games(best_model, n, n_envs=args.n_envs)
+    print(f'\nlatest ({os.path.basename(latest)}) vs random, {n} games, {args.n_envs} parallel envs')
+    latest_wins = play_games(latest_model, n, n_envs=args.n_envs)
 
     bw, lw = best_wins, latest_wins
     bp = 100.0 * bw / n

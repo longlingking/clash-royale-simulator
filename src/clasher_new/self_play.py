@@ -4,18 +4,26 @@ What this module adds on top of ``train.py``:
 
 - fixed *scripted* opponents (baselines that never learn);
 - ``OpponentPool``: picks the training opponent from a weighted mix of
-  recent self-play checkpoints, base checkpoints and fixed strategies;
+  recent self-play checkpoints, base checkpoints and fixed strategies, with
+  optional per-candidate *adaptive* priorities (future.md #2);
+- ``OpponentEpisodeWrapper`` / ``make_opponent_vec_env``: per-episode opponent
+  sampling inside a ``SubprocVecEnv`` (IsaacLab-style batch-level mixing);
 - ``evaluate_agent``: winrate of a model against a fixed crowd;
-- ``OpponentSwapCallback`` / ``BestWeightCallback``: the two SB3 callbacks
-  that wire the pool and the best-model selection into ``model.learn()``.
+- ``OpponentSwapCallback`` (legacy window-level swapping) / ``BestWeightCallback``
+  / ``AdaptiveWeightCallback``: the SB3 callbacks that wire the pool, the
+  best-model selection and the adaptive opponent weights into ``model.learn()``.
 """
 import glob
 import os
 import random
 
+import gymnasium as gym
 import numpy as np
+import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from environment import CREnv, random_strategy, entity_names
 from card_utils import Card
@@ -127,7 +135,7 @@ class OpponentPool:
 
     def __init__(self, base_checkpoints=(), recent_dir='cr_logs', prefix='cr',
                  n_recent=6, fixed_strategies=None, weights=None,
-                 deterministic=False, device='cpu', seed=None):
+                 deterministic=False, device='cpu', seed=None, priorities=None):
         self.base_checkpoints = list(base_checkpoints)
         self.recent_dir = recent_dir
         self.prefix = prefix
@@ -136,12 +144,21 @@ class OpponentPool:
         self.deterministic = deterministic
         self.device = device
         self.weights = dict(weights or {'recent': 0.6, 'base': 0.2, 'fixed': 0.2})
+        self.priorities = dict(priorities or {})  # candidate key -> sampling weight
+        self.last_key = None  # key of the opponent most recently handed out
         self._rng = random.Random(seed)
         self._cache = {}  # path -> loaded PPO (bounds memory)
 
     def _recent_paths(self):
         pattern = os.path.join(self.recent_dir, f'{self.prefix}_*_steps.zip')
-        return sorted(glob.glob(pattern))[-self.n_recent:]
+        # Sort by the step count embedded in the filename, NOT by the
+        # filename string: lexicographic order breaks once step counts cross a
+        # digit-length boundary ('cr_100000_steps.zip' < 'cr_20000_steps.zip').
+        suffix = '_steps.zip'
+        def step(path):
+            base = os.path.basename(path)
+            return int(base[len(self.prefix) + 1:-len(suffix)])
+        return sorted(glob.glob(pattern), key=step)[-self.n_recent:]
 
     def _load(self, path):
         if path not in self._cache:
@@ -154,26 +171,177 @@ class OpponentPool:
         model = self._load(path)
         return lambda obs: model.predict(obs, deterministic=self.deterministic)[0]
 
-    def pick(self):
-        """Return one opponent callable for the next training window."""
-        choices = []  # (weight, 'path'|'fn', payload)
+    def child(self, rank, base_seed=None):
+        """A fresh pool for one vectorised-env subprocess.
+
+        Each child of a ``SubprocVecEnv`` needs its own RNG — otherwise every
+        env draws the same opponent in lock-step instead of mixing — and its
+        own model cache, so checkpoints load lazily inside the child instead
+        of being pickled across processes.
+        """
+        return OpponentPool(
+            base_checkpoints=self.base_checkpoints,
+            recent_dir=self.recent_dir,
+            prefix=self.prefix,
+            n_recent=self.n_recent,
+            fixed_strategies=self.fixed_strategies,
+            weights=self.weights,
+            priorities=self.priorities,
+            deterministic=self.deterministic,
+            device=self.device,
+            seed=(base_seed + rank) if base_seed is not None else None,
+        )
+
+    # ------------------------------------------------------------------
+    # Candidate keys + adaptive priorities (future.md #2)
+    #
+    # Every candidate has a stable key: 'recent:cr_123456_steps.zip',
+    # 'base:cr_discrete.zip', 'fixed:bridge_rush_script'. priorities[key]
+    # scales its sampling share; the main-process AdaptiveWeightCallback
+    # derives these from in-training winrates and pushes them here. With no
+    # priorities set (all default 1.0) sampling is bit-for-bit the old
+    # uniform two-stage scheme.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _key(bucket, payload):
+        if bucket == 'fixed':
+            return f'fixed:{payload.__name__}'
+        return f'{bucket}:{os.path.basename(payload)}'
+
+    def set_priorities(self, priorities):
+        """Replace the per-candidate sampling priorities (full dict)."""
+        self.priorities = dict(priorities)
+
+    def _priority(self, key):
+        return self.priorities.get(key, 1.0)
+
+    def _weighted_candidates(self):
+        """Flat ``[(weight, kind, payload, key)]`` for one weighted draw.
+
+        ``weight = base_bucket_weight / bucket_size * priority``, so within a
+        bucket members are drawn in proportion to their priority, and a
+        bucket's total share scales with the mean priority of its members
+        (the whole fixed bucket shrinks once every script is crushed).
+        """
+        entries = []  # (weight, kind, payload, key)
         recent = self._recent_paths()
         if recent:
-            choices.append((self.weights['recent'], 'path', self._rng.choice(recent)))
+            w = self.weights['recent'] / len(recent)
+            for path in recent:
+                key = self._key('recent', path)
+                entries.append((w * self._priority(key), 'path', path, key))
         if self.base_checkpoints:
-            choices.append((self.weights['base'], 'path', self._rng.choice(self.base_checkpoints)))
+            w = self.weights['base'] / len(self.base_checkpoints)
+            for path in self.base_checkpoints:
+                key = self._key('base', path)
+                entries.append((w * self._priority(key), 'path', path, key))
         if self.fixed_strategies:
-            choices.append((self.weights['fixed'], 'fn', self._rng.choice(self.fixed_strategies)))
-        if not choices:
+            w = self.weights['fixed'] / len(self.fixed_strategies)
+            for fn in self.fixed_strategies:
+                key = self._key('fixed', fn)
+                entries.append((w * self._priority(key), 'fn', fn, key))
+        return entries
+
+    def pick(self):
+        """Return one opponent callable for the next training episode.
+
+        Weighted draw over all current candidates (bucket base weight times the
+        candidate's adaptive priority). Also records ``self.last_key`` so
+        callers can attribute the episode result to the right opponent.
+        """
+        entries = self._weighted_candidates()
+        if not entries:
+            self.last_key = 'fixed:random_strategy'
             return random_strategy
 
-        r = self._rng.random() * sum(w for w, _, _ in choices)
-        for w, kind, payload in choices:
+        total = sum(w for w, _, _, _ in entries)
+        r = self._rng.random() * total
+        for w, kind, payload, key in entries:
             r -= w
             if r <= 0:
+                self.last_key = key
                 return self._model_opponent(payload) if kind == 'path' else payload
-        kind, payload = choices[-1][1], choices[-1][2]
+        _, kind, payload, key = entries[-1]
+        self.last_key = key
         return self._model_opponent(payload) if kind == 'path' else payload
+
+
+# ---------------------------------------------------------------------------
+# Per-episode opponent sampling for vectorised training (future.md #1)
+# ---------------------------------------------------------------------------
+
+class OpponentEpisodeWrapper(gym.Wrapper):
+    """Re-pick the training opponent from a pool at every ``reset()``.
+
+    When used inside a ``SubprocVecEnv`` this replaces window-level swapping
+    (``OpponentSwapCallback``): each sub-env re-draws its opponent per
+    episode, so a single PPO rollout mixes trajectories from all opponent
+    types in proportion to the pool weights (IsaacLab-style batch mixing).
+
+    It also feeds :class:`AdaptiveWeightCallback` (future.md #2): on every
+    finished episode it reports which opponent was played and whether player 0
+    (the agent) won, via ``info['opponent']`` / ``info['won']``. ``Monitor``
+    (outermost) preserves these keys, so they reach the main process.
+    """
+
+    def __init__(self, env, pool):
+        super().__init__(env)
+        self.pool = pool
+        self._current_key = None
+
+    def reset(self, **kwargs):
+        self.unwrapped.opponent = self.pool.pick()
+        # The pool records which opponent it just handed out; remember it so we
+        # can attribute this episode's result when it ends.
+        self._current_key = getattr(self.pool, 'last_key', None)
+        return super().reset(**kwargs)
+
+    def step(self, action):
+        obs, reward, termination, truncation, info = self.env.step(action)
+        if (termination or truncation) and self._current_key is not None:
+            info = dict(info)
+            info['opponent'] = self._current_key
+            info['won'] = int(self.unwrapped.battle.winner == 0)
+        return obs, reward, termination, truncation, info
+
+    def set_priorities(self, priorities):
+        """Forward adaptive priorities from the main process to the pool."""
+        if hasattr(self.pool, 'set_priorities'):
+            self.pool.set_priorities(priorities)
+
+    def get_priorities(self):
+        """Read the pool's priorities back (used by tests / debugging)."""
+        return dict(getattr(self.pool, 'priorities', {}))
+
+
+def make_opponent_vec_env(pool, n_envs=8, seed=None, visualize=False, speed=1.0,
+                          start_method=None):
+    """A ``SubprocVecEnv`` of ``n_envs`` CREnv for self-play training.
+
+    Each sub-env is wrapped in :class:`OpponentEpisodeWrapper` and holds its
+    own ``pool.child(rank)``, so every episode draws its opponent from the
+    pool independently. Model checkpoints load lazily inside each child (never
+    pickled across processes) and the deck lists are per-process copies, so
+    envs don't stomp on each other's shuffle state.
+
+    The envs are also wrapped in ``Monitor`` so SB3's PPO can log
+    ``rollout/ep_rew_mean`` / ``ep_len_mean`` (it reads episode rewards from
+    ``info["episode"]``, which only ``Monitor`` injects).
+    """
+    def make_env(rank):
+        def _init():
+            # Children run their own opponent inference; keep them
+            # single-threaded so K subprocesses don't fight over torch's pool.
+            torch.set_num_threads(1)
+            env = CREnv(opponent_model=None, visualize=visualize, speed=speed)
+            env = OpponentEpisodeWrapper(env, pool.child(rank, base_seed=seed))
+            # filename=None: no CSV, we only need info["episode"] for logging.
+            return Monitor(env, filename=None)
+        return _init
+
+    return SubprocVecEnv([make_env(i) for i in range(n_envs)],
+                         start_method=start_method)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +472,94 @@ class BestWeightCallback(BaseCallback):
             if self.verbose:
                 print(f'[best] new best {score:.3f} -> saved {self.best_path}')
         return score
+
+
+def adapt_priorities(buffer, old, alpha=0.3, floor=0.1):
+    """Turn a ``{key: (wins, games)}`` buffer into smoothed priorities.
+
+    ``priority = max(floor, 1 - winrate)`` — opponents that still beat the
+    agent get a high priority (worth sampling more), ones it crushes fall to
+    the floor (sampled rarely but never zeroed, so the agent can't forget
+    them). The result is exponentially smoothed against ``old`` so weights
+    don't chase single-episode noise. Pure function: unit-testable without an
+    env.
+    """
+    out = {}
+    for key, (wins, games) in buffer.items():
+        if games <= 0:
+            continue
+        target = max(floor, 1.0 - wins / games)
+        out[key] = alpha * target + (1.0 - alpha) * old.get(key, 1.0)
+    return out
+
+
+class AdaptiveWeightCallback(BaseCallback):
+    """Re-sample the opponent pool from in-training winrates (future.md #2).
+
+    Every finished training episode reports ``(opponent, won)`` through
+    ``info`` (see :class:`OpponentEpisodeWrapper`). This callback accumulates
+    those in the main process and, every ``update_every`` env-steps, converts
+    the per-candidate winrate into a sampling priority (via
+    :func:`adapt_priorities`) and pushes the new priorities into every
+    sub-env's ``OpponentPool`` through ``env_method``. ``pick()`` then spends
+    more episodes on opponents that still beat the agent and fewer on ones it
+    crushes.
+
+    The FIXED eval crowd used by :class:`BestWeightCallback` is untouched —
+    that stays the stable ruler for best-model selection.
+    """
+
+    def __init__(self, update_every=50_000, alpha=0.3, floor=0.1, verbose=0):
+        super().__init__(verbose)
+        self.update_every = update_every
+        self.alpha = alpha
+        self.floor = floor
+        self._buffer = {}      # candidate key -> [wins, games] since last update
+        self._priorities = {}  # candidate key -> smoothed priority
+        self._last_update = -1
+
+    @staticmethod
+    def _tag(key):
+        # ':' and '.' are awkward in tensorboard metric names.
+        return key.replace(':', '_').replace('.', '_').replace('/', '_')
+
+    def _init_callback(self):
+        self._last_update = -1
+
+    def _on_step(self):
+        # One call per vec-step; infos/dones are the per-env lists.
+        for info, done in zip(self.locals.get('infos', []),
+                              self.locals.get('dones', [])):
+            if done and 'opponent' in info and 'won' in info:
+                key = info['opponent']
+                wins, games = self._buffer.get(key, (0, 0))
+                self._buffer[key] = (wins + int(info['won']), games + 1)
+        if (self.num_timesteps > 0
+                and self.num_timesteps != self._last_update
+                and self.num_timesteps % self.update_every == 0):
+            self._update()
+        return True
+
+    def _update(self):
+        self._last_update = self.num_timesteps
+        updated = adapt_priorities(self._buffer, self._priorities,
+                                   alpha=self.alpha, floor=self.floor)
+        if self.logger is not None:
+            for key, (wins, games) in self._buffer.items():
+                if games > 0:
+                    tag = self._tag(key)
+                    self.logger.record(f'adap/winrate_{tag}', wins / games)
+                    self.logger.record(f'adap/priority_{tag}', updated[key])
+        self._priorities.update(updated)
+        self._buffer = {}
+        if not updated:
+            return
+        env = self.training_env
+        if env is not None and hasattr(env, 'env_method'):
+            env.env_method('set_priorities', self._priorities)
+        if self.verbose:
+            short = {k.split(':')[-1]: v for k, v in sorted(updated.items())}
+            print('[adap] priorities: ' + ', '.join(f'{k}={v:.2f}' for k, v in short.items()))
 
 
 if __name__ == '__main__':
