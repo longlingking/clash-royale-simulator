@@ -23,7 +23,11 @@ class Buffer:
     def add_transition(self, data):
         # This is batched data and lifted for storage.
         # (B, ...) -> (B, 1, ...)
-        self._buffer.extend(data.unsqueeze(1))
+        # CR grids are ~35 KB/step, so the buffer lives on CPU
+        # (buffer.storage_device=cpu) to keep the GPU for the model; move
+        # incoming transitions there explicitly (sample() then transfers
+        # each batch back to the device with pin_memory + non_blocking).
+        self._buffer.extend(data.unsqueeze(1).to(self.storage_device))
 
     def sample(self):
         sample_td, info = self._buffer.sample(return_info=True)

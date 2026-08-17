@@ -29,6 +29,10 @@ COMPILE=${COMPILE:-0}      # torch.compile the update fn (GPU only; needs triton
 # Harmless on GPU: autocast there is fp16 via cuDNN, oneDNN only touches CPU ops.
 export ONEDNN_MAX_CPU_ISA=AVX2
 
+# Replay buffer on CPU: CR grids are ~35 KB/step and the GPU is only 24 GB,
+# so pre-allocating the buffer there OOMs. Capacity = steps + margin.
+BUFFER_ARGS="buffer.storage_device=cpu buffer.max_size=$((STEPS + 10000))"
+
 if [ "$GPU" = "1" ]; then
     DEV_ARGS="device=cuda env.env_num=$ENV_NUM model.compile=$COMPILE"
 else
@@ -41,6 +45,7 @@ python train.py \
     logdir=logdir/${DATE}_${METHOD}_cr \
     model.rep_loss=${METHOD} \
     $DEV_ARGS \
+    $BUFFER_ARGS \
     batch_size=16 \
     batch_length=64 \
     trainer.train_ratio=64 \

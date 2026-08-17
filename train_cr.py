@@ -37,13 +37,21 @@ def main():
                     help="torch.compile the update fn (GPU mode only; needs triton)")
     ap.add_argument("--logdir", default=None,
                     help="override logdir (default logdir/<MMDD>_r2dreamer_cr)")
+    ap.add_argument("--max-size", type=int, default=None,
+                    help="replay buffer capacity in steps (default steps+10000)")
     args = ap.parse_args()
 
     date = datetime.datetime.now().strftime("%m%d")
+    max_size = args.max_size or (args.steps + 10000)
     overrides = [
         "env=cr",
         f"env.steps={args.steps}",
         "model.rep_loss=r2dreamer",
+        # Replay buffer on CPU: CR grids are ~35 KB/step, the GPU is only
+        # 24 GB, and pre-allocating the buffer there OOMs (sample() transfers
+        # each batch back to the device via pin_memory + non_blocking).
+        "buffer.storage_device=cpu",
+        f"buffer.max_size={max_size}",
         "batch_size=16",
         "batch_length=64",
         "trainer.train_ratio=64",
