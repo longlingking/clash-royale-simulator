@@ -97,6 +97,13 @@ class TwoHot:
         wavg = ((p1 * b1).flip(dims=(-1,)) + (p2 * b2)).sum(dim=-1, keepdim=True)
         return self.unsquash(wavg)
 
+    def mean(self):
+        # (..., N_bins), (N_bins,) -> (..., 1)
+        # Expected value over the softmax bins.  Unlike mode(), this keeps the
+        # signal of rare-but-important outcomes (e.g. sparse tower-damage /
+        # win-loss rewards) that the argmax-style mode collapses to zero.
+        return self.unsquash((self.probs * self.bins).sum(dim=-1, keepdim=True))
+
     def log_prob(self, target):
         # (..., 1)
         assert target.dtype == self.probs.dtype

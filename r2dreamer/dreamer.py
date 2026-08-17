@@ -447,7 +447,13 @@ class Dreamer(nn.Module):
         imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
 
         # (B*T, T_imag, 1)
-        imag_reward = self._frozen_reward(imag_feat).mode()
+        # Use the MEAN of the predicted reward, not the mode: CR rewards are
+        # sparse in time (mostly 0 with occasional tower-damage / win-loss
+        # spikes), so the argmax collapses the imagined return to ~0 and the
+        # advantage goes to zero (the actor then only learns entropy).  The
+        # mean keeps the rare-but-important reward signal in the imagined
+        # lambda-return.
+        imag_reward = self._frozen_reward(imag_feat).mean
         # (B*T, T_imag, 1)  probability of continuation
         imag_cont = self._frozen_cont(imag_feat).mean
         # (B*T, T_imag, 1)
