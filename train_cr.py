@@ -23,12 +23,20 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _R2D = os.path.join(_HERE, "r2dreamer")
 
 
+def _parse_int(s):
+    """Accept plain ints and scientific notation like 2e5, 5e5 (as Hydra does)."""
+    try:
+        return int(s)
+    except ValueError:
+        return int(float(s))
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Train R2-Dreamer on the Clash Royale simulator (repo root entry)."
     )
-    ap.add_argument("steps", nargs="?", type=int, default=500000,
-                    help="total env steps (default 500000)")
+    ap.add_argument("steps", nargs="?", type=_parse_int, default=500000,
+                    help="total env steps (default 500000; supports 2e5)")
     ap.add_argument("--gpu", action="store_true",
                     help="train on cuda with --env-num parallel CPU sim workers")
     ap.add_argument("--env-num", type=int, default=8,
@@ -37,8 +45,10 @@ def main():
                     help="torch.compile the update fn (GPU mode only; needs triton)")
     ap.add_argument("--logdir", default=None,
                     help="override logdir (default logdir/<MMDD>_r2dreamer_cr)")
-    ap.add_argument("--max-size", type=int, default=None,
-                    help="replay buffer capacity in steps (default steps+10000)")
+    ap.add_argument("--max-size", type=_parse_int, default=None,
+                    help="replay buffer capacity in steps (default steps+10000; supports 3e5)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the train.py command and exit without running")
     args = ap.parse_args()
 
     date = datetime.datetime.now().strftime("%m%d")
@@ -74,6 +84,8 @@ def main():
 
     print(f"[train_cr] cwd -> {_R2D}")
     print(f"[train_cr] python train.py {' '.join(overrides)}")
+    if args.dry_run:
+        sys.exit(0)
     sys.exit(subprocess.call([sys.executable, "train.py", *overrides], cwd=_R2D))
 
 
