@@ -64,12 +64,30 @@ _GRID_SCALE = np.array(
 
 
 class ClashRoyale(gym.Env):
-    """gymnasium adapter of CREnv for r2dreamer (DreamerV3 / R2-Dreamer)."""
+    """gymnasium adapter of CREnv for r2dreamer (DreamerV3 / R2-Dreamer).
 
-    def __init__(self, opponent="random", seed=0, speed=1.0):
+    Two opponent modes:
+
+    - ``opponent`` (default): a single fixed opponent for the whole run
+      (``random`` / ``script:...`` / an SB3 checkpoint path).  Used for the
+      eval envs and for training when self-play is disabled.
+    - ``pool``: an :class:`~envs.cr_opponents.OpponentPool`.  Every
+      ``reset()`` picks a fresh opponent for the coming episode (old-PPO-style
+      per-episode self-play sampling) and tells it to reset its recurrent
+      state.  Finished episodes report ``(opponent_key, won)`` so the
+      main-process :class:`~envs.cr_opponents.SelfPlayController` can adapt
+      the pool's sampling priorities from in-training winrates.
+    """
+
+    def __init__(self, opponent="random", seed=0, speed=1.0, pool=None):
         super().__init__()
         self._opponent = opponent
-        self._env = CREnv(opponent_model=self._make_opponent(opponent), speed=speed)
+        self.pool = pool
+        self._env = CREnv(
+            opponent_model=None if pool is not None else self._make_opponent(opponent),
+            speed=speed,
+        )
+        self._episode_results = []  # [(opponent_key, won), ...] since last pull
 
         self.observation_space = gym.spaces.Dict(
             {
@@ -109,6 +127,13 @@ class ClashRoyale(gym.Env):
         # the legacy gym API: reset() returns the bare observation dict (no
         # (obs, info) tuple) and step() returns a 4-tuple (obs, reward, done,
         # info).
+        if self.pool is not None:
+            opponent = self.pool.pick()
+            self._env.opponent = opponent
+            # Recurrent (RSSM) opponents reset their latent state here; the
+            # stateless ones ignore this hook.
+            if hasattr(opponent, "reset_episode"):
+                opponent.reset_episode()
         obs, _ = self._env.reset(seed=seed, options=options)
         return self._obs(obs, is_first=True)
 
@@ -118,6 +143,12 @@ class ClashRoyale(gym.Env):
         y = int(np.argmax(action[5:37]))
         x = int(np.argmax(action[37:55]))
         obs, reward, terminated, truncated, _ = self._env.step((slot, y, x))
+        if (terminated or truncated) and self.pool is not None:
+            # Attribute the episode result to the opponent that was picked at
+            # its last reset (mirrors OpponentEpisodeWrapper's info hook).
+            key = getattr(self.pool, "last_key", None)
+            if key is not None:
+                self._episode_results.append((key, int(self._env.battle.winner == 0)))
         is_last = bool(terminated or truncated)
         return (
             self._obs(obs, is_first=False, is_last=is_last, is_terminal=bool(terminated)),
@@ -125,6 +156,19 @@ class ClashRoyale(gym.Env):
             is_last,
             {},
         )
+
+    # -- self-play hooks (called from the main process via Parallel.call_each) --
+
+    def get_episode_results(self):
+        """Return and clear the ``[(opponent_key, won), ...]`` accumulated here."""
+        out = list(self._episode_results)
+        self._episode_results = []
+        return out
+
+    def set_pool_priorities(self, priorities):
+        """Push adaptive sampling priorities into this env's pool."""
+        if self.pool is not None:
+            self.pool.set_priorities(priorities)
 
     def _obs(self, raw, is_first=False, is_last=False, is_terminal=False):
         grid = raw["grid"] / _GRID_SCALE

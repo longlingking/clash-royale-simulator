@@ -45,6 +45,30 @@ class OpponentEpisodeWrapper(gym.Wrapper):
 
 **不变**：`BestWeightCallback` 用的固定评审团（`make_eval_crowd`）保持固定——它仍是选 `best_model` 的唯一稳定标尺。
 
+## 3. r2dreamer 走旧 PPO 的 self-play 对手选择
+
+> ✅ 已实现（`r2dreamer/envs/cr_opponents.py`：`DreamerOpponent` / `OpponentPool` /
+> `SelfPlayController`；`r2dreamer/envs/cr.py` 的 `pool=` 模式；`trainer.save_snapshot`
+> 周期性快照；`runs/cr.sh` 的 `SELF_PLAY=1`）。测试：`tests/test_cr_selfplay.py`。
+
+**目标**：把 #1（per-episode 对手池采样）和 #2（winrate 自适应优先级）搬到
+R2-Dreamer 世界模型上——训练 agent 逐局从"最近 self-play 快照 / 基础 checkpoint /
+固定脚本"加权池里抽对手，且随训练从自己最新的快照演化（self-play 对手演化）。
+
+**与旧 PPO 的差异**：
+- 对手从 SB3 PPO checkpoint 换成 **r2dreamer `.pt` 快照**（RSSM 循环策略）。
+  `DreamerOpponent` 用与 `src/clasher_new/play_r2dreamer.py` 相同的配方重建 agent
+  （读快照旁 `.hydra/config.yaml`、`clone_and_freeze`、线程化 latent state），
+  并解码成 `CREnv` 的 `(slot, y, x)`；也兼容旧的 `.zip`（SB3）base checkpoint。
+- "recent" 桶 = `<logdir>/snapshots/r2dreamer_<step>_steps.pt`，由
+  `trainer.save_snapshot`（`trainer.snapshot_every` / `n_snapshots`）周期写入并裁剪。
+- 每局上报 `(opponent, won)` 由 `ClashRoyale` 累积，主进程 `SelfPlayController`
+  经 `ParallelEnv.call_each` 拉取并广播新优先级（对应旧 `AdaptiveWeightCallback`）。
+
+**启用**：`SELF_PLAY=1 bash runs/cr.sh <steps>`（等价
+`env.opponent_pool.enabled=true trainer.snapshot_every=2e4 trainer.n_snapshots=8`）。
+eval 环境仍用固定 `env.opponent`（对应旧 `BestWeightCallback` 的固定评审团）。
+
 ## 优先级小结
 
 | 项目 | 收益 | 优先级 |

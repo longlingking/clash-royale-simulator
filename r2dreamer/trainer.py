@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 import tools
@@ -24,6 +26,13 @@ class OnlineTrainer:
         self._should_log = tools.Every(config.update_log_every)
         self._should_eval = tools.Every(self.eval_every)
         self._should_save = tools.Every(config.save_every)
+        # Self-play: periodic policy snapshots feed the opponent pool's
+        # "recent" bucket so opponents evolve with the agent (old-PPO-style).
+        self._should_snapshot = tools.Every(int(config.snapshot_every))
+        self.n_snapshots = max(1, int(config.n_snapshots))  # keep at least 1
+        # Optional adaptive-priority controller attached by make_envs() when a
+        # CR self-play opponent pool is enabled (None otherwise).
+        self.self_play = getattr(train_envs, "self_play", None)
         self._action_repeat = config.action_repeat
 
     def save(self, agent, step):
@@ -37,6 +46,37 @@ class OnlineTrainer:
             self.logdir / "latest.pt",
         )
         print(f"[{step}] checkpoint saved -> {self.logdir / 'latest.pt'}")
+
+    def save_snapshot(self, agent, step):
+        """Keep a lightweight policy snapshot for the self-play opponent pool.
+
+        Snapshots are the "recent" bucket of ``OpponentPool``: the training
+        agent plays against its own recent selves, so the opponent roster
+        evolves with the policy (old-PPO self-play).  Only the weights are
+        saved (no optimizer state) and old snapshots are pruned to
+        ``self.n_snapshots`` to bound disk usage.
+        """
+        snap_dir = self.logdir / "snapshots"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {"agent_state_dict": agent.state_dict(), "step": int(step)},
+            snap_dir / f"r2dreamer_{int(step)}_steps.pt",
+        )
+        # Prune to the newest n_snapshots BY STEP COUNT, not by filename
+        # string: lexicographic order breaks once step counts cross a
+        # digit-length boundary ('r2dreamer_100000_steps.pt' <
+        # 'r2dreamer_20000_steps.pt'), which would delete the newest
+        # snapshots instead of the oldest (same pitfall the old
+        # self_play.py OpponentPool._recent_paths guards against).
+        def step_of(path):
+            base = os.path.basename(path)
+            return int(base[len("r2dreamer") + 1:-len("_steps.pt")])
+
+        snaps = sorted(snap_dir.glob("r2dreamer_*_steps.pt"), key=step_of)
+        for stale in snaps[:-self.n_snapshots]:
+            stale.unlink(missing_ok=True)
+        kept = min(len(snaps), self.n_snapshots)
+        print(f"[{step}] self-play snapshot -> {snap_dir} ({kept} kept)")
 
     def eval(self, agent, train_step):
         """Run evaluation episodes.
@@ -141,6 +181,12 @@ class OnlineTrainer:
             # Periodic checkpoint (crash/OOM protection)
             if self._should_save(step):
                 self.save(agent, step)
+            # Periodic self-play snapshot (feeds the opponent pool's "recent" bucket)
+            if self._should_snapshot(step):
+                self.save_snapshot(agent, step)
+            # Adaptive opponent priorities (old-PPO self-play controller)
+            if self.self_play is not None:
+                self.self_play.update(step)
             # Save metrics
             if done.any():
                 for i, d in enumerate(done):

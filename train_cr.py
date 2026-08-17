@@ -8,6 +8,8 @@ required.  Defaults mirror ``r2dreamer/runs/cr.sh``:
     python train_cr.py 2000             # CPU, custom steps
     python train_cr.py --gpu 2000       # GPU (cuda) + 8 parallel CPU sim workers
     python train_cr.py --gpu --env-num 16 --compile 200000
+    python train_cr.py --gpu --self-play 2000   # + old-PPO-style self-play opponents
+    python train_cr.py --gpu --self-play 2000 --dry-run   # preview the train.py command
 
 Architecture: the simulator always runs in CPU subprocesses (ParallelEnv
 workers); only agent inference + world-model updates run on the device
@@ -43,10 +45,18 @@ def main():
                     help="parallel sim workers (GPU mode only)")
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile the update fn (GPU mode only; needs triton)")
+    ap.add_argument("--self-play", action="store_true",
+                    help="old-PPO-style self-play opponents: per-episode weighted mix of "
+                         "recent self-play snapshots / base checkpoints / fixed strategies, "
+                         "with adaptive priorities from winrates "
+                         "(same as SELF_PLAY=1 in runs/cr.sh)")
     ap.add_argument("--logdir", default=None,
                     help="override logdir (default logdir/<MMDD>_r2dreamer_cr)")
     ap.add_argument("--max-size", type=_parse_int, default=None,
                     help="replay buffer capacity in steps (default steps+10000; supports 3e5)")
+    ap.add_argument("--extra", action="append", default=[],
+                    help="extra Hydra override(s), repeatable, e.g. "
+                         "--extra env.opponent_pool.verbose=true")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the train.py command and exit without running")
     args = ap.parse_args()
@@ -75,6 +85,16 @@ def main():
         ]
     else:
         overrides += ["device=cpu", "model.compile=False", "env.env_num=1"]
+    if args.self_play:
+        # Old-PPO-style self-play: enable the opponent pool and have the
+        # trainer keep periodic policy snapshots that feed its "recent" bucket
+        # (mirrors SELF_PLAY=1 in runs/cr.sh).
+        overrides += [
+            "env.opponent_pool.enabled=true",
+            "trainer.snapshot_every=2e4",
+            "trainer.n_snapshots=8",
+        ]
+    overrides += args.extra
     overrides.append("logdir=" + (args.logdir or f"logdir/{date}_r2dreamer_cr"))
 
     # CPU updates use bf16 autocast; oneDNN's bf16 backward crashes on

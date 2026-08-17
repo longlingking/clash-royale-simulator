@@ -40,3 +40,8 @@ trainer:
   action_repeat: ${env.action_repeat}
   # Save a checkpoint every N environment steps (protects against crashes/OOM).
   save_every: 1e4
+  # Self-play: save a policy snapshot every N env steps to logdir/snapshots/
+  # (0 disables; enable for the CR opponent pool so opponents evolve with the
+  # agent).  Only weights are saved; old snapshots are pruned to n_snapshots.
+  snapshot_every: 0
+  n_snapshots: 8

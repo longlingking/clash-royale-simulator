@@ -11,12 +11,39 @@ train_ratio: 64
 
 seed: ${seed}
 device: ${device}
+# Root logdir (needed by the self-play opponent pool to locate its snapshot
+# directory and the run's Hydra config for reconstructing Dreamer opponents).
+logdir: ${logdir}
 
-# Opponent for the trained agent: 'random' (default), a scripted strategy
+# Opponent for the trained agent when self-play is disabled (and for the eval
+# envs in both modes): 'random' (default), a scripted strategy
 # ('script:bridge_rush' | 'script:bridge_rush_left' | 'script:defender'), or
 # a path to a stable-baselines3 PPO checkpoint.
 opponent: 'random'
 speed: 1.0
+
+# Old-PPO-style self-play opponent selection (enabled: true).
+#
+# Per training episode the agent fights an opponent drawn from a weighted mix
+# of the *recent self-play snapshots of itself* (<logdir>/snapshots/,
+# written by trainer.save_snapshot when trainer.snapshot_every > 0), frozen
+# base checkpoints, and fixed strategies.  Adaptive priorities derived from
+# in-training winrates re-weight the mix every `update_every` env-steps, so
+# opponents that still beat the agent get sampled more (same rule as the old
+# self_play.py OpponentPool / AdaptiveWeightCallback).
+opponent_pool:
+  enabled: false
+  prefix: 'r2dreamer'              # snapshot filename prefix
+  n_recent: 6                      # how many of the most recent snapshots are eligible
+  base_checkpoints: []             # extra frozen checkpoints: .pt (r2dreamer) or .zip (sb3)
+  fixed_strategies: ['random', 'script:bridge_rush', 'script:bridge_rush_left', 'script:defender']
+  weights: {recent: 0.6, base: 0.2, fixed: 0.2}
+  deterministic: false             # false = opponents sample actions (variety)
+  device: 'cpu'                    # opponent inference device (inside the sim workers)
+  update_every: 5e4                # env steps between adaptive priority updates
+  alpha: 0.3                       # priority smoothing factor
+  floor: 0.1                       # minimum priority per candidate
+  verbose: false
 
 encoder:
   mlp_keys: '^(hand|elixir)$'

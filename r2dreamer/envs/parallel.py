@@ -37,6 +37,17 @@ class ParallelEnv:
                 td[key] = td[key].unsqueeze(-1)
         return td
 
+    def call_each(self, name, *args, **kwargs):
+        """Call ``name(*args, **kwargs)`` on every underlying env (in its worker).
+
+        Used by the self-play controller to pull per-episode results
+        (``get_episode_results``) and push adaptive pool priorities
+        (``set_pool_priorities``) into each worker's ``OpponentPool``.
+        """
+        # The Parallel proxy returns an unresolved Future; calling it again
+        # resolves the worker's answer.
+        return [getattr(e, name)(*args, **kwargs)() for e in self.envs]
+
     def step(self, action, done):
         """Step all environments.
 
@@ -103,16 +114,34 @@ class Parallel:
         self.worker.close()
 
     @staticmethod
+    def _attr(state, name):
+        """Resolve an attribute on the (possibly wrapped) env.
+
+        Plain ``getattr`` only sees the outermost wrapper's own attributes; in
+        gymnasium >= 1.1 the ``Wrapper`` chain is no longer transparent via
+        ``__getattr__``.  Fall back to ``get_wrapper_attr`` so the self-play
+        hooks (``get_episode_results`` / ``set_pool_priorities``) defined on the
+        inner ``ClashRoyale`` env stay reachable from the main process.
+        """
+        try:
+            return getattr(state, name)
+        except AttributeError:
+            get_wrapper_attr = getattr(state, "get_wrapper_attr", None)
+            if get_wrapper_attr is not None:
+                return get_wrapper_attr(name)
+            raise
+
+    @staticmethod
     def _respond(constructor, state, message, name, *args, **kwargs):
         state = state or constructor()  # Instantiate at first time
         if message == PMessage.CALLABLE:
             assert not args and not kwargs, (args, kwargs)
-            result = callable(getattr(state, name))
+            result = callable(Parallel._attr(state, name))
         elif message == PMessage.CALL:
-            result = getattr(state, name)(*args, **kwargs)
+            result = Parallel._attr(state, name)(*args, **kwargs)
         elif message == PMessage.READ:
             assert not args and not kwargs, (args, kwargs)
-            result = getattr(state, name)
+            result = Parallel._attr(state, name)
         return state, result
 
 

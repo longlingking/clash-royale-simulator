@@ -9,17 +9,37 @@ def make_envs(config):
     if suite == "isaaclab":
         return _make_isaaclab_envs(config)
 
-    def env_constructor(idx):
-        return lambda: make_env(config, idx)
+    def env_constructor(idx, train=True):
+        return lambda: make_env(config, idx, train=train)
 
-    train_envs = parallel.ParallelEnv(env_constructor, config.env_num, config.device)
+    train_envs = parallel.ParallelEnv(lambda i: env_constructor(i, train=True),
+                                      config.env_num, config.device)
     eval_envs = (
-        parallel.ParallelEnv(env_constructor, config.eval_episode_num, config.device)
+        parallel.ParallelEnv(lambda i: env_constructor(i, train=False),
+                             config.eval_episode_num, config.device)
         if config.eval_episode_num > 0
         else None
     )
     obs_space = train_envs.observation_space
     act_space = train_envs.action_space
+
+    # Old-PPO-style self-play: when the env config enables an opponent pool,
+    # attach a main-process controller that adapts the per-candidate sampling
+    # priorities from in-training winrates.  The trainer drives it via
+    # ``train_envs.self_play`` (None for every non-self-play setup).
+    if suite == "cr":
+        pool_cfg = getattr(config, "opponent_pool", None)
+        if pool_cfg is not None and bool(getattr(pool_cfg, "enabled", False)):
+            from envs.cr_opponents import SelfPlayController
+
+            train_envs.self_play = SelfPlayController(
+                train_envs,
+                update_every=getattr(pool_cfg, "update_every", 5e4),
+                alpha=getattr(pool_cfg, "alpha", 0.3),
+                floor=getattr(pool_cfg, "floor", 0.1),
+                verbose=getattr(pool_cfg, "verbose", False),
+            )
+
     return train_envs, eval_envs, obs_space, act_space
 
 
@@ -52,7 +72,7 @@ def _make_isaaclab_envs(config):
     return train_envs, eval_envs, obs_space, act_space
 
 
-def make_env(config, id):
+def make_env(config, id, train=True):
     suite, task = config.task.split("_", 1)
     if suite == "dmc":
         import envs.dmc as dmc
@@ -103,9 +123,28 @@ def make_env(config, id):
     elif suite == "cr":
         # Clash Royale simulator (clash-royale-simulator). The action space is
         # already a flat multi one-hot Box (multi_discrete), no wrapper needed.
+        # Absolutize the logdir *before* importing envs.cr: that import chdirs
+        # into the simulator dir, which would corrupt relative paths.
+        import os
+
+        abs_logdir = ""
+        if getattr(config, "logdir", None):
+            abs_logdir = os.path.abspath(config.logdir)
+
         import envs.cr as cr
 
-        env = cr.ClashRoyale(opponent=config.opponent, seed=config.seed + id, speed=config.speed)
+        pool_cfg = getattr(config, "opponent_pool", None)
+        if train and pool_cfg is not None and bool(getattr(pool_cfg, "enabled", False)):
+            from envs.cr_opponents import build_opponent_pool
+
+            pool = build_opponent_pool(pool_cfg, logdir=abs_logdir,
+                                       rank=id, base_seed=config.seed)
+            env = cr.ClashRoyale(pool=pool, seed=config.seed + id, speed=config.speed)
+        else:
+            # Eval envs (train=False) always use the fixed `opponent` — the
+            # stable ruler for episode/eval_score (mirrors the old PPO
+            # BestWeightCallback's fixed crowd).
+            env = cr.ClashRoyale(opponent=config.opponent, seed=config.seed + id, speed=config.speed)
     else:
         raise NotImplementedError(suite)
     env = wrappers.TimeLimit(env, config.time_limit // config.action_repeat)

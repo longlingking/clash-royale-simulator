@@ -7,6 +7,7 @@
 #   GPU=1 bash runs/cr.sh 2000              # GPU (cuda) + 8 parallel CPU sim workers
 #   GPU=1 ENV_NUM=16 bash runs/cr.sh 2000   # GPU, custom parallelism
 #   GPU=1 COMPILE=1 bash runs/cr.sh 2000    # GPU + torch.compile (needs triton)
+#   SELF_PLAY=1 bash runs/cr.sh 2000        # old-PPO-style self-play opponents
 #
 # Architecture: the simulator always runs in CPU subprocesses (ParallelEnv
 # workers, one per env); only the agent policy inference + world-model
@@ -15,6 +16,11 @@
 #
 # Opponent options in configs/env/cr.yaml: 'random' | 'script:bridge_rush' |
 # 'script:bridge_rush_left' | 'script:defender' | <sb3 checkpoint path>.
+# SELF_PLAY=1 switches the TRAINING envs to the old-PPO self-play opponent
+# pool (env.opponent_pool.enabled=true): per-episode weighted mix of recent
+# self-play snapshots of the agent, base checkpoints and fixed strategies,
+# with adaptive priorities from winrates.  Snapshots are written by the
+# trainer every snapshot_every steps (see trainer.snapshot_every/n_snapshots).
 
 DATE=$(date +%m%d)
 STEPS=${1:-500000}
@@ -22,6 +28,7 @@ METHOD=r2dreamer
 GPU=${GPU:-0}
 ENV_NUM=${ENV_NUM:-8}      # parallel sim workers (CPU subprocesses)
 COMPILE=${COMPILE:-0}      # torch.compile the update fn (GPU only; needs triton)
+SELF_PLAY=${SELF_PLAY:-0}  # old-PPO-style self-play opponent pool
 
 # r2dreamer uses bf16 autocast for the CPU update step; oneDNN's bf16
 # backward path crashes on avx2_vnni_2 CPUs (e.g. Intel Core Ultra 200
@@ -39,6 +46,13 @@ else
     DEV_ARGS="device=cpu model.compile=False env.env_num=1"
 fi
 
+SELF_PLAY_ARGS=""
+if [ "$SELF_PLAY" = "1" ]; then
+    # Old-PPO-style self-play opponents: enable the opponent pool and have the
+    # trainer keep periodic policy snapshots that feed its "recent" bucket.
+    SELF_PLAY_ARGS="env.opponent_pool.enabled=true trainer.snapshot_every=2e4 trainer.n_snapshots=8"
+fi
+
 python train.py \
     env=cr \
     env.steps=$STEPS \
@@ -46,6 +60,7 @@ python train.py \
     model.rep_loss=${METHOD} \
     $DEV_ARGS \
     $BUFFER_ARGS \
+    $SELF_PLAY_ARGS \
     batch_size=16 \
     batch_length=64 \
     trainer.train_ratio=64 \
