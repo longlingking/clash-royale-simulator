@@ -1,6 +1,6 @@
 """Measure battle step cost vs battlefield complexity (crowded games)."""
-import sys, time
-sys.path.insert(0, '/home/longling/随便玩玩/clash-royale-simulator/r2dreamer')
+import os, sys, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'r2dreamer'))
 import numpy as np
 from envs.cr import ClashRoyale
 

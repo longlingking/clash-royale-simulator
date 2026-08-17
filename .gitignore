@@ -16,3 +16,6 @@ r2dreamer/logdir/
 r2dreamer/.hydra/
 .pylibs/
 tb_logs/
+
+# conda package cache (B-machine local)
+.conda-pkgs/
